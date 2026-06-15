@@ -1,0 +1,10 @@
+[OPTIONS]
+Compiled file=basic.chm
+Default topic=a.htm
+Title=rustchm basic test
+Language=0x409
+
+[FILES]
+a.htm
+b.htm
+style.css

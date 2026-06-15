@@ -1,0 +1,7 @@
+/target
+Cargo.lock
+*.chm
+*.chw
+test/xb/
+test/hhx/
+test/x*/
