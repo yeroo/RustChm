@@ -1,7 +1,7 @@
 # rustchm
 
 [![CI](https://github.com/yeroo/RustChm/actions/workflows/ci.yml/badge.svg)](https://github.com/yeroo/RustChm/actions/workflows/ci.yml)
-[![crates.io](https://img.shields.io/crates/v/rustchm.svg)](https://crates.io/crates/rustchm)
+[![crates.io](https://img.shields.io/crates/v/rustchm)](https://crates.io/crates/rustchm)
 [![Release](https://img.shields.io/github/v/release/yeroo/RustChm)](https://github.com/yeroo/RustChm/releases/latest)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![OpenSSF Scorecard](https://api.securityscorecards.dev/projects/github.com/yeroo/RustChm/badge)](https://scorecard.dev/viewer/?uri=github.com/yeroo/RustChm)
