@@ -2,6 +2,8 @@
 Cargo.lock
 *.chm
 *.chw
-test/xb/
-test/hhx/
+# extract / round-trip scratch dirs
 test/x*/
+test/r*/
+test/hhx/
+!test/run_tests.py
