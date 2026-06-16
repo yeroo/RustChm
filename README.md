@@ -1,8 +1,15 @@
 # rustchm
 
+[![CI](https://github.com/yeroo/RustChm/actions/workflows/ci.yml/badge.svg)](https://github.com/yeroo/RustChm/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/yeroo/RustChm)](https://github.com/yeroo/RustChm/releases/latest)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![OpenSSF Scorecard](https://api.securityscorecards.dev/projects/github.com/yeroo/RustChm/badge)](https://scorecard.dev/viewer/?uri=github.com/yeroo/RustChm)
+
 A fast, dependency-free CHM (Microsoft HTML Help) compiler **and reader** in Rust —
-a complete port of [FastChm](https://github.com/yeroo/FastChm) (C++). No external
-crates; standard library only. Builds and runs on Windows and Linux.
+a complete port of [FastChm](https://github.com/yeroo/FastChm) (C++). No runtime
+dependencies (only a build-time crate that embeds Windows version metadata); the
+shipped binary is a single self-contained executable. Builds and runs on Windows
+and Linux.
 
 ```
 rustchm <project.hhp> [-o output.chm]

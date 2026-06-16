@@ -2,5 +2,24 @@
 name = "rustchm"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
+description = "A fast, dependency-free CHM (Microsoft HTML Help) compiler and reader, in Rust."
+authors = ["yeroo"]
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/yeroo/RustChm"
+homepage = "https://github.com/yeroo/RustChm"
+keywords = ["chm", "htmlhelp", "lzx", "compiler", "itsf"]
+categories = ["command-line-utilities", "compression"]
 
 [dependencies]
+
+# Build-only: embeds Windows version/publisher metadata into the .exe. Not linked
+# at runtime — the shipped binary is still a single self-contained executable.
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1
