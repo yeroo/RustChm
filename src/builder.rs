@@ -1,13 +1,21 @@
-//! Compiles an HTML Help project (.hhp) into a .chm. Minimal core port of
-//! FastChm's builder.cpp (content + #SYSTEM/#STRINGS/#TOPICS/#URLSTR/#URLTBL +
-//! ::DataSpace + LZX). Sitemap/FTS/binary-index features come later.
+//! Compiles an HTML Help project (.hhp) into a .chm. Full port of FastChm's
+//! builder.cpp: auto-inclusion, sitemap, binary TOC/index, KLinks/ALinks,
+//! window definitions, context IDs, merge files, subsets, full-text search,
+//! codepage/Unicode handling, and collection builds.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 
 use crate::bytebuf::Buf;
 use crate::chmwriter::{write_container, DirEntry};
+use crate::fifti::FtsIndexer;
 use crate::lzx::lzx_compress;
+use crate::objinst_data::OBJINST_CHAR_TABLE;
+use crate::sitemap::{parse_sitemap, scan_link_objects, SiteMap, SiteMapItem};
+use crate::textenc::{
+    append_utf16le, codepage_for_lcid, decode_auto, decode_text, encode_codepage,
+    is_dbcs_codepage,
+};
 
 pub struct Stats {
     pub file_count: usize,
@@ -22,33 +30,104 @@ fn slashes(s: &str) -> String {
 fn lower(s: &str) -> String {
     s.to_ascii_lowercase()
 }
+fn trim(s: &str) -> &str {
+    s.trim()
+}
 
+// ---------------- HHP project ----------------
+
+#[derive(Default)]
 struct Project {
     dir: String,
     options: HashMap<String, String>,
     files: Vec<String>,
+    window_lines: Vec<String>,
+    merge_files: Vec<String>,
+    subsets: Vec<String>,
+    info_types: Vec<String>,
+    aliases: Vec<(String, String)>,    // name -> file
+    map_defs: Vec<(String, u32)>,      // name -> context id
 }
 
 impl Project {
     fn opt(&self, k: &str) -> String {
         self.options.get(k).cloned().unwrap_or_default()
     }
+    fn opt_yes(&self, k: &str) -> bool {
+        matches!(lower(&self.opt(k)).as_str(), "yes" | "true" | "1")
+    }
+}
+
+fn parse_alias_line(line: &str, dir: &str, p: &mut Project) {
+    if line.starts_with('#') {
+        let mut inc = trim(&line[line.find([' ', '\t']).map(|x| x + 1).unwrap_or(line.len())..]).to_string();
+        if inc.starts_with('"') {
+            inc = inc.trim_matches('"').to_string();
+        }
+        if let Ok(raw) = std::fs::read(format!("{dir}{}", slashes(&inc))) {
+            let text = String::from_utf8_lossy(&raw).into_owned();
+            for l in text.lines() {
+                let l = trim(l);
+                if !l.is_empty() && !l.starts_with(';') {
+                    parse_alias_line(l, dir, p);
+                }
+            }
+        }
+        return;
+    }
+    if let Some(eq) = line.find('=') {
+        let mut file = trim(&line[eq + 1..]).to_string();
+        if let Some(semi) = file.find(';') {
+            file = trim(&file[..semi]).to_string();
+        }
+        p.aliases.push((trim(&line[..eq]).to_string(), slashes(&file)));
+    }
+}
+
+fn parse_map_line(line: &str, dir: &str, p: &mut Project) {
+    if let Some(rest) = line.strip_prefix("#define") {
+        let rest = trim(rest);
+        if let Some(sp) = rest.find([' ', '\t']) {
+            let name = trim(&rest[..sp]).to_string();
+            let v = trim(&rest[sp..]);
+            let id = if let Some(h) = v.strip_prefix("0x").or_else(|| v.strip_prefix("0X")) {
+                u32::from_str_radix(h, 16).unwrap_or(0)
+            } else {
+                v.parse().unwrap_or(0)
+            };
+            p.map_defs.push((name, id));
+        }
+    } else if let Some(rest) = line.strip_prefix("#include") {
+        let mut inc = trim(rest).to_string();
+        if inc.starts_with('"') || inc.starts_with('<') {
+            inc = inc[1..inc.len() - 1].to_string();
+        }
+        if let Ok(raw) = std::fs::read(format!("{dir}{}", slashes(&inc))) {
+            let text = String::from_utf8_lossy(&raw).into_owned();
+            for l in text.lines() {
+                let l = trim(l);
+                if !l.is_empty() {
+                    parse_map_line(l, dir, p);
+                }
+            }
+        }
+    }
 }
 
 fn parse_hhp(path: &str) -> std::io::Result<Project> {
     let raw = std::fs::read(path)?;
     let mut text = String::from_utf8_lossy(&raw).into_owned();
-    if let Some(stripped) = text.strip_prefix('\u{feff}') {
-        text = stripped.to_string();
+    if let Some(s) = text.strip_prefix('\u{feff}') {
+        text = s.to_string();
     }
     let dirp = Path::new(path).parent().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
     let dir = if dirp.is_empty() { String::new() } else { slashes(&dirp) + "/" };
 
-    let mut p = Project { dir, options: HashMap::new(), files: Vec::new() };
+    let mut p = Project { dir: dir.clone(), ..Default::default() };
     let mut section = String::new();
-    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut seen: HashSet<String> = HashSet::new();
     for line in text.lines() {
-        let line = line.trim();
+        let line = trim(line);
         if line.is_empty() || line.starts_with(';') {
             continue;
         }
@@ -56,22 +135,31 @@ fn parse_hhp(path: &str) -> std::io::Result<Project> {
             section = lower(&line[1..line.len() - 1]);
             continue;
         }
-        if section == "options" {
-            if let Some(eq) = line.find('=') {
-                p.options.insert(lower(line[..eq].trim()), line[eq + 1..].trim().to_string());
+        match section.as_str() {
+            "options" => {
+                if let Some(eq) = line.find('=') {
+                    p.options.insert(lower(trim(&line[..eq])), trim(&line[eq + 1..]).to_string());
+                }
             }
-        } else if section == "files" {
-            let f = slashes(line);
-            if seen.insert(lower(&f)) {
-                p.files.push(f);
+            "files" => {
+                let f = slashes(line);
+                if seen.insert(lower(&f)) {
+                    p.files.push(f);
+                }
             }
+            "windows" => p.window_lines.push(line.to_string()),
+            "alias" => parse_alias_line(line, &dir, &mut p),
+            "map" => parse_map_line(line, &dir, &mut p),
+            "merge files" => p.merge_files.push(slashes(line)),
+            "subsets" => p.subsets.push(line.to_string()),
+            "infotypes" => p.info_types.push(line.to_string()),
+            _ => {}
         }
     }
     Ok(p)
 }
 
 fn parse_lcid(language: &str) -> u32 {
-    // accepts "0x409 ..." or decimal
     let tok = language.split_whitespace().next().unwrap_or("");
     let v = if let Some(h) = tok.strip_prefix("0x").or_else(|| tok.strip_prefix("0X")) {
         u32::from_str_radix(h, 16).ok()
@@ -81,48 +169,323 @@ fn parse_lcid(language: &str) -> u32 {
     v.filter(|&x| x != 0).unwrap_or(0x409)
 }
 
-fn extract_title(html: &[u8]) -> String {
-    let text = String::from_utf8_lossy(html);
-    let lc = text.to_ascii_lowercase();
-    let t = match lc.find("<title") {
-        Some(x) => x,
-        None => return String::new(),
-    };
-    let gt = match lc[t..].find('>') {
-        Some(x) => t + x + 1,
-        None => return String::new(),
-    };
-    let end = match lc[gt..].find("</title") {
-        Some(x) => gt + x,
-        None => return String::new(),
-    };
-    let raw = &text[gt..end];
-    let mut out = String::new();
-    let mut ws = false;
-    for c in raw.chars() {
-        if c.is_whitespace() {
-            ws = !out.is_empty();
-        } else {
-            if ws {
-                out.push(' ');
-            }
-            ws = false;
-            out.push(c);
-        }
-    }
-    out
+// ---------------- [WINDOWS] ----------------
+
+const WP_PROPERTIES: u32 = 0x0002;
+const WP_STYLES: u32 = 0x0004;
+const WP_EXSTYLES: u32 = 0x0008;
+const WP_RECT: u32 = 0x0010;
+const WP_NAV_WIDTH: u32 = 0x0020;
+const WP_SHOWSTATE: u32 = 0x0040;
+const WP_TB_FLAGS: u32 = 0x0100;
+const WP_EXPANSION: u32 = 0x0200;
+const WP_TABPOS: u32 = 0x0400;
+const WP_CUR_TAB: u32 = 0x2000;
+
+#[derive(Default)]
+struct Window {
+    typ: String,
+    caption: String,
+    toc: String,
+    index: String,
+    default_file: String,
+    home: String,
+    jump1_file: String,
+    jump1_text: String,
+    jump2_file: String,
+    jump2_text: String,
+    nav_style: u32,
+    nav_width: u32,
+    buttons: u32,
+    rect: [i32; 4],
+    styles: u32,
+    ex_styles: u32,
+    show_state: u32,
+    nav_closed: u32,
+    nav_default: u32,
+    nav_pos: u32,
+    notify_id: u32,
+    valid_flags: u32,
 }
 
-// ---- #STRINGS ----
+fn parse_int(s: &str) -> u32 {
+    let s = trim(s);
+    if let Some(h) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        u32::from_str_radix(h, 16).unwrap_or(0)
+    } else {
+        s.parse().unwrap_or(0)
+    }
+}
+
+fn parse_window_line(raw_line: &str) -> Window {
+    let mut line: Vec<u8> = raw_line.bytes().collect();
+    if let Some(eq) = line.iter().position(|&c| c == b'=') {
+        line[eq] = b',';
+    }
+    let s = String::from_utf8_lossy(&line).into_owned();
+    let b = s.as_bytes();
+    let mut tok: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i <= b.len() {
+        let mut cur = String::new();
+        if i < b.len() && b[i] == b'"' {
+            let close = b[i + 1..].iter().position(|&c| c == b'"').map(|x| i + 1 + x);
+            match close {
+                Some(c) => {
+                    cur = s[i + 1..c].to_string();
+                    i = c + 1;
+                    i = s[i..].find(',').map(|x| i + x + 1).unwrap_or(b.len() + 1);
+                }
+                None => i = b.len() + 1,
+            }
+        } else {
+            let comma = s[i..].find(',').map(|x| i + x).unwrap_or(b.len());
+            cur = trim(&s[i..comma]).to_string();
+            i = comma + 1;
+        }
+        tok.push(cur);
+    }
+
+    let mut w = Window::default();
+    let str_at = |idx: usize| tok.get(idx).cloned().unwrap_or_default();
+    let num = |idx: usize, bit: u32, w: &mut Window| -> u32 {
+        if idx >= tok.len() || tok[idx].is_empty() {
+            return 0;
+        }
+        if bit != 0 {
+            w.valid_flags |= bit;
+        }
+        parse_int(&tok[idx])
+    };
+
+    w.typ = str_at(0);
+    w.caption = str_at(1);
+    w.toc = slashes(&str_at(2));
+    w.index = slashes(&str_at(3));
+    w.default_file = slashes(&str_at(4));
+    w.home = slashes(&str_at(5));
+    w.jump1_file = slashes(&str_at(6));
+    w.jump1_text = str_at(7);
+    w.jump2_file = slashes(&str_at(8));
+    w.jump2_text = str_at(9);
+    w.nav_style = num(10, WP_PROPERTIES, &mut w);
+    w.nav_width = num(11, WP_NAV_WIDTH, &mut w);
+    w.buttons = num(12, WP_TB_FLAGS, &mut w);
+
+    let mut idx = 13;
+    if idx < tok.len() && tok[idx].starts_with('[') {
+        let mut any = false;
+        let mut k = 0;
+        while k < 4 && idx < tok.len() {
+            let mut v = tok[idx].clone();
+            v = v.replace('[', "");
+            let last = v.contains(']');
+            if let Some(br) = v.find(']') {
+                v = v[..br].to_string();
+            }
+            if !trim(&v).is_empty() {
+                any = true;
+            }
+            w.rect[k] = trim(&v).parse().unwrap_or(0);
+            idx += 1;
+            if last {
+                break;
+            }
+            k += 1;
+        }
+        if any {
+            w.valid_flags |= WP_RECT;
+        }
+    } else if idx < tok.len() {
+        idx += 1;
+    }
+    w.styles = num(idx, WP_STYLES, &mut w);
+    idx += 1;
+    w.ex_styles = num(idx, WP_EXSTYLES, &mut w);
+    idx += 1;
+    w.show_state = num(idx, WP_SHOWSTATE, &mut w);
+    idx += 1;
+    w.nav_closed = num(idx, WP_EXPANSION, &mut w);
+    idx += 1;
+    w.nav_default = num(idx, WP_CUR_TAB, &mut w);
+    idx += 1;
+    w.nav_pos = num(idx, WP_TABPOS, &mut w);
+    idx += 1;
+    w.notify_id = num(idx, 0, &mut w);
+    w
+}
+
+// ---------------- HTML scanning ----------------
+
+fn is_html_name(name: &str) -> bool {
+    let l = lower(name);
+    l.contains(".ht") && !l.contains(".hhc") && !l.contains(".hhk")
+}
+
+fn extract_title_s(html: &[u8], cp: u32) -> Vec<u8> {
+    let cps = decode_text(html, cp);
+    let lc = |c: u32| if (b'A' as u32..=b'Z' as u32).contains(&c) { c + 32 } else { c };
+    let find = |pat: &str, from: usize| -> Option<usize> {
+        let pb: Vec<u32> = pat.bytes().map(|c| c as u32).collect();
+        if pb.len() > cps.len() {
+            return None;
+        }
+        (from..=cps.len() - pb.len()).find(|&i| (0..pb.len()).all(|j| lc(cps[i + j]) == pb[j]))
+    };
+    let mut t = match find("<title", 0) {
+        Some(x) => x,
+        None => return Vec::new(),
+    };
+    while t < cps.len() && cps[t] != b'>' as u32 {
+        t += 1;
+    }
+    if t >= cps.len() {
+        return Vec::new();
+    }
+    t += 1;
+    let end = match find("</title", t) {
+        Some(x) => x,
+        None => return Vec::new(),
+    };
+    let mut title: Vec<u32> = Vec::new();
+    let mut ws = false;
+    for &c in &cps[t..end] {
+        if c == b' ' as u32 || c == b'\t' as u32 || c == b'\r' as u32 || c == b'\n' as u32 {
+            ws = !title.is_empty();
+        } else {
+            if ws {
+                title.push(b' ' as u32);
+            }
+            ws = false;
+            title.push(c);
+        }
+    }
+    encode_codepage(&title, cp)
+}
+
+fn is_word_char_b(c: u8) -> bool {
+    c.is_ascii_alphanumeric() || c == b'-' || c == b'_'
+}
+
+fn extract_refs(html: &[u8], out: &mut Vec<String>) {
+    let text = html;
+    let lc: Vec<u8> = text.iter().map(|&b| if b.is_ascii_uppercase() { b + 32 } else { b }).collect();
+    for key in [b"href".as_slice(), b"src".as_slice()] {
+        let mut pos = 0;
+        while let Some(found) = lc[pos..].windows(key.len()).position(|w| w == key) {
+            let at = pos + found;
+            pos = at + key.len();
+            if at > 0 && is_word_char_b(lc[at - 1]) {
+                continue;
+            }
+            let mut i = pos;
+            while i < text.len() && text[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            if i >= text.len() || text[i] != b'=' {
+                continue;
+            }
+            i += 1;
+            while i < text.len() && text[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            let mut value: Vec<u8> = Vec::new();
+            if i < text.len() && (text[i] == b'"' || text[i] == b'\'') {
+                let q = text[i];
+                i += 1;
+                while i < text.len() && text[i] != q {
+                    value.push(text[i]);
+                    i += 1;
+                }
+            } else {
+                while i < text.len() && text[i] != b'>' && !text[i].is_ascii_whitespace() {
+                    value.push(text[i]);
+                    i += 1;
+                }
+            }
+            if !value.is_empty() {
+                out.push(String::from_utf8_lossy(&value).into_owned());
+            }
+        }
+    }
+}
+
+fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out: Vec<u8> = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() && b[i + 1].is_ascii_hexdigit() && b[i + 2].is_ascii_hexdigit() {
+            out.push(u8::from_str_radix(&s[i + 1..i + 3], 16).unwrap_or(b'%'));
+            i += 3;
+        } else {
+            out.push(b[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn resolve_ref(base_dir: &str, link: &str) -> String {
+    let link = trim(link);
+    if link.is_empty() || link.starts_with('#') {
+        return String::new();
+    }
+    if let Some(colon) = link.find(':') {
+        if link.find('/').map(|s| s > colon).unwrap_or(true) {
+            return String::new(); // scheme / drive
+        }
+    }
+    let cut = link.find(['#', '?']).unwrap_or(link.len());
+    let link = slashes(&percent_decode(&link[..cut]));
+    if link.is_empty() {
+        return String::new();
+    }
+    let full = if link.starts_with('/') {
+        link[1..].to_string()
+    } else {
+        format!("{base_dir}{link}")
+    };
+    let mut parts: Vec<&str> = Vec::new();
+    for seg in full.split('/') {
+        if seg.is_empty() || seg == "." {
+            continue;
+        }
+        if seg == ".." {
+            if parts.pop().is_none() {
+                return String::new();
+            }
+        } else {
+            parts.push(seg);
+        }
+    }
+    parts.join("/")
+}
+
+fn dir_of(rel: &str) -> String {
+    match rel.rfind('/') {
+        Some(s) => rel[..=s].to_string(),
+        None => String::new(),
+    }
+}
+
+// ---------------- #STRINGS / #URLSTR+#URLTBL / #TOPICS ----------------
+
+/// Encodes a (possibly non-ASCII) string to raw codepage bytes for storage in the
+/// byte-oriented metadata files (#STRINGS).
+fn enc_cp(s: &str, cp: u32) -> Vec<u8> {
+    encode_codepage(&decode_auto(s, cp), cp)
+}
+
 struct Strings {
     buf: Buf,
-    map: HashMap<String, u32>,
+    map: HashMap<Vec<u8>, u32>,
 }
 impl Strings {
     fn new() -> Self {
         Strings { buf: Buf::new(), map: HashMap::new() }
     }
-    fn add(&mut self, s: &str) -> u32 {
+    fn add(&mut self, s: &[u8]) -> u32 {
         if self.buf.is_empty() {
             self.buf.u8(0);
         }
@@ -138,13 +501,16 @@ impl Strings {
             self.buf.zeros(next_block - pos);
             pos = next_block;
         }
-        self.buf.strz(s);
-        self.map.insert(s.to_string(), pos as u32);
+        self.buf.raw(s);
+        self.buf.u8(0);
+        self.map.insert(s.to_vec(), pos as u32);
         pos as u32
+    }
+    fn add_str(&mut self, s: &str, cp: u32) -> u32 {
+        self.add(&enc_cp(s, cp))
     }
 }
 
-// ---- #URLSTR / #URLTBL ----
 struct Urls {
     urlstr: Buf,
     urltbl: Buf,
@@ -188,16 +554,21 @@ impl Urls {
 
 struct Topics {
     buf: Buf,
+    by_url: HashMap<String, u32>,
 }
 impl Topics {
     fn new() -> Self {
-        Topics { buf: Buf::new() }
+        Topics { buf: Buf::new(), by_url: HashMap::new() }
     }
-    fn add(&mut self, strings: &mut Strings, urls: &mut Urls, title: &str, mut url: String, code: i32) {
+    fn count(&self) -> u32 {
+        (self.buf.len() / 16) as u32
+    }
+    fn add(&mut self, strings: &mut Strings, urls: &mut Urls, title: &[u8], url: &str, code: i32) -> u32 {
+        let mut url = url.to_string();
         if url.starts_with('/') {
             url.remove(0);
         }
-        let topic_index = (self.buf.len() / 16) as u32;
+        let topic_index = self.count();
         let str_off = if title.is_empty() { 0xFFFFFFFFu32 } else { strings.add(title) };
         let tbl_off = urls.add_url(&url, topic_index);
         let in_contents: u16 = if code >= 0 {
@@ -214,6 +585,19 @@ impl Topics {
         self.buf.u32(tbl_off);
         self.buf.u16(in_contents);
         self.buf.u16(0);
+        self.by_url.entry(lower(&url)).or_insert(topic_index);
+        topic_index
+    }
+    fn find(&self, url: &str) -> i32 {
+        let mut url = url.to_string();
+        if url.starts_with('/') {
+            url.remove(0);
+        }
+        self.by_url.get(&lower(&url)).map(|&v| v as i32).unwrap_or(-1)
+    }
+    fn patch_toc_offset(&mut self, topic: u32, value: u32) {
+        let off = topic as usize * 16;
+        self.buf.v[off..off + 4].copy_from_slice(&value.to_le_bytes());
     }
 }
 
@@ -223,209 +607,4 @@ fn sys_entry_str(b: &mut Buf, code: u16, value: &str) {
     b.strz(value);
 }
 
-fn build_namelist() -> Vec<u8> {
-    let mut b = Buf::new();
-    b.u16(0);
-    b.u16(2);
-    for name in ["Uncompressed", "MSCompressed"] {
-        b.u16(name.len() as u16);
-        for c in name.bytes() {
-            b.u16(c as u16);
-        }
-        b.u16(0);
-    }
-    let words = (b.len() / 2) as u16;
-    b.v[0] = words as u8;
-    b.v[1] = (words >> 8) as u8;
-    b.v
-}
-
-fn build_control_data() -> Vec<u8> {
-    let mut b = Buf::new();
-    b.u32(6);
-    b.raw(b"LZXC");
-    b.u32(2); // version
-    b.u32(2); // reset interval (0x8000 units)
-    b.u32(2); // window size (0x8000 units)
-    b.u32(1); // cache size
-    b.u32(0);
-    b.u32(0);
-    b.v
-}
-
-fn build_reset_table(uncompressed: u64, compressed: u64, frame_starts: &[u64]) -> Vec<u8> {
-    let mut b = Buf::new();
-    b.u32(2);
-    b.u32(frame_starts.len() as u32);
-    b.u32(8);
-    b.u32(0x28);
-    b.u64(uncompressed);
-    b.u64(compressed);
-    b.u64(0x8000);
-    for &off in frame_starts {
-        b.u64(off);
-    }
-    b.v
-}
-
-fn build_transform_list() -> Vec<u8> {
-    let g = b"{7FC28940-9D31-11D0-9B27-00A0C91E9C7C}";
-    let mut b = Buf::new();
-    for i in 0..19 {
-        b.u16(g[i] as u16);
-    }
-    b.v
-}
-
-fn build_system(p: &Project, lcid: u32, hhc: &str, hhk: &str) -> Vec<u8> {
-    let mut b = Buf::new();
-    b.u32(3);
-    b.u16(10);
-    b.u16(4);
-    b.u32(0); // timestamp (deterministic)
-    sys_entry_str(&mut b, 9, concat!("rustchm ", env!("CARGO_PKG_VERSION")));
-    b.u16(4);
-    b.u16(36);
-    b.u32(lcid);
-    b.u32(0);
-    b.u32(0);
-    b.u32(0);
-    b.u32(0);
-    b.u64(0);
-    b.u32(0);
-    b.u32(0);
-    let def_topic = slashes(&p.opt("default topic"));
-    if !def_topic.is_empty() {
-        sys_entry_str(&mut b, 2, &def_topic);
-    }
-    if !p.opt("title").is_empty() {
-        sys_entry_str(&mut b, 3, &p.opt("title"));
-    }
-    if !p.opt("default font").is_empty() {
-        sys_entry_str(&mut b, 16, &p.opt("default font"));
-    }
-    if !hhc.is_empty() {
-        sys_entry_str(&mut b, 0, hhc);
-    }
-    if !hhk.is_empty() {
-        sys_entry_str(&mut b, 1, hhk);
-    }
-    b.v
-}
-
-pub fn compile_project(hhp_path: &str, out_override: &str) -> Result<(Stats, String), String> {
-    let mut p = parse_hhp(hhp_path).map_err(|e| format!("cannot read project: {e}"))?;
-    let lcid = parse_lcid(&p.opt("language"));
-    let hhc = slashes(&p.opt("contents file"));
-    let hhk = slashes(&p.opt("index file"));
-
-    let ensure = |files: &mut Vec<String>, f: &str| {
-        if f.is_empty() {
-            return;
-        }
-        if !files.iter().any(|e| lower(e) == lower(f)) {
-            files.push(f.to_string());
-        }
-    };
-    ensure(&mut p.files, &hhc);
-    ensure(&mut p.files, &hhk);
-    if p.files.is_empty() {
-        return Err("project has no [FILES]".into());
-    }
-
-    let mut strings = Strings::new();
-    let mut urls = Urls::new();
-    let mut topics = Topics::new();
-    let mut entries: Vec<DirEntry> = Vec::new();
-    let mut section1 = Buf::new();
-
-    let mut add_sec1 = |entries: &mut Vec<DirEntry>, section1: &mut Buf, name: String, data: &[u8]| {
-        entries.push(DirEntry { name, section: 1, offset: section1.len() as u64, size: data.len() as u64 });
-        section1.raw(data);
-    };
-
-    let mut file_count = 0;
-    for f in &p.files {
-        let path = format!("{}{}", p.dir, f);
-        let data = std::fs::read(&path).map_err(|e| format!("cannot read {path}: {e}"))?;
-        add_sec1(&mut entries, &mut section1, format!("/{f}"), &data);
-        let lf = lower(f);
-        if lf.contains(".ht") && !lf.contains(".hhc") && !lf.contains(".hhk") {
-            topics.add(&mut strings, &mut urls, &extract_title(&data), format!("/{f}"), -1);
-        }
-        file_count += 1;
-    }
-    if !hhc.is_empty() {
-        topics.add(&mut strings, &mut urls, "", hhc.clone(), 2);
-    }
-    if !hhk.is_empty() {
-        topics.add(&mut strings, &mut urls, "", hhk.clone(), 2);
-    }
-
-    if !topics.buf.is_empty() {
-        add_sec1(&mut entries, &mut section1, "/#TOPICS".into(), &topics.buf.v);
-    }
-    if !urls.urlstr.is_empty() {
-        add_sec1(&mut entries, &mut section1, "/#URLSTR".into(), &urls.urlstr.v);
-    }
-    if !urls.urltbl.is_empty() {
-        add_sec1(&mut entries, &mut section1, "/#URLTBL".into(), &urls.urltbl.v);
-    }
-    if strings.buf.is_empty() {
-        strings.buf.u8(0);
-    }
-    add_sec1(&mut entries, &mut section1, "/#STRINGS".into(), &strings.buf.v);
-
-    let uncompressed = section1.len() as u64;
-    let lzx = lzx_compress(&section1.v);
-
-    // ---- section 0 ----
-    let mut section0 = Buf::new();
-    let mut add_sec0 = |entries: &mut Vec<DirEntry>, section0: &mut Buf, name: String, data: &[u8]| {
-        entries.push(DirEntry { name, section: 0, offset: section0.len() as u64, size: data.len() as u64 });
-        section0.raw(data);
-    };
-    entries.push(DirEntry { name: "/#ITBITS".into(), section: 0, offset: 0, size: 0 });
-    add_sec0(&mut entries, &mut section0, "/#SYSTEM".into(), &build_system(&p, lcid, &hhc, &hhk));
-    add_sec0(&mut entries, &mut section0, "::DataSpace/NameList".into(), &build_namelist());
-    add_sec0(&mut entries, &mut section0, "::DataSpace/Storage/MSCompressed/ControlData".into(), &build_control_data());
-    {
-        let mut span = Buf::new();
-        span.u64(uncompressed);
-        add_sec0(&mut entries, &mut section0, "::DataSpace/Storage/MSCompressed/SpanInfo".into(), &span.v);
-    }
-    add_sec0(&mut entries, &mut section0, "::DataSpace/Storage/MSCompressed/Transform/List".into(), &build_transform_list());
-    add_sec0(
-        &mut entries,
-        &mut section0,
-        "::DataSpace/Storage/MSCompressed/Transform/{7FC28940-9D31-11D0-9B27-00A0C91E9C7C}/InstanceData/ResetTable".into(),
-        &build_reset_table(uncompressed, lzx.data.len() as u64, &lzx.frame_starts),
-    );
-    entries.push(DirEntry {
-        name: "::DataSpace/Storage/MSCompressed/Content".into(),
-        section: 0,
-        offset: section0.len() as u64,
-        size: lzx.data.len() as u64,
-    });
-
-    // ---- output path ----
-    let out = if !out_override.is_empty() {
-        out_override.to_string()
-    } else {
-        let compiled = slashes(&p.opt("compiled file"));
-        if !compiled.is_empty() {
-            format!("{}{}", p.dir, compiled)
-        } else {
-            let stem = Path::new(hhp_path).file_stem().unwrap().to_string_lossy();
-            format!("{}{}.chm", p.dir, stem)
-        }
-    };
-
-    let size = write_container(&out, lcid, entries, &section0.v, &lzx.data)
-        .map_err(|e| format!("write failed: {e}"))?;
-
-    Ok((
-        Stats { file_count, uncompressed, compressed: lzx.data.len() as u64, output: size },
-        out,
-    ))
-}
+include!("builder_parts.rs");

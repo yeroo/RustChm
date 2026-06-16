@@ -1,0 +1,11 @@
+<!DOCTYPE HTML PUBLIC "-//IETF//DTD HTML//EN">
+<HTML><HEAD></HEAD><BODY>
+<OBJECT type="text/site properties"><param name="ImageType" value="Folder"></OBJECT>
+<UL>
+	<LI> <OBJECT type="text/sitemap"><param name="Name" value="Introduction"><param name="Local" value="intro.htm"></OBJECT>
+	<UL>
+		<LI> <OBJECT type="text/sitemap"><param name="Name" value="Details"><param name="Local" value="details.htm"></OBJECT>
+		<LI> <OBJECT type="text/sitemap"><param name="Name" value="Nested"><param name="Local" value="sub/nested.htm"></OBJECT>
+	</UL>
+</UL>
+</BODY></HTML>

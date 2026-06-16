@@ -1,0 +1,18 @@
+[OPTIONS]
+Compatibility=1.1 or later
+Compiled file=featured.chm
+Contents file=featured.hhc
+Index file=featured.hhk
+Default topic=intro.htm
+Default Window=main
+Title=rustchm Featured Test
+Language=0x409
+Binary TOC=Yes
+Binary Index=Yes
+Full-text search=Yes
+
+[WINDOWS]
+main="rustchm Featured","featured.hhc","featured.hhk","intro.htm","intro.htm",,,,,0x63520,250,0x10384e,[20,20,820,620],,,,,,,0
+
+[FILES]
+intro.htm
